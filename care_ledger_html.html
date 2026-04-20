@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="出納帳">
+<title>利用者出納帳</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f5;color:#1a1a1a;font-size:16px}
+  input,select,button{font-family:inherit;font-size:14px;outline:none}
+  input,select{width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:8px;background:#fff;color:#1a1a1a}
+  input:focus,select:focus{border-color:#3b82f6}
+  button{cursor:pointer;border-radius:8px;padding:8px 14px;border:1px solid #ddd;background:#fff;color:#1a1a1a}
+  button:active{opacity:0.7}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const INIT_USERS = ["田中 花子","佐藤 一郎","山本 よし子","鈴木 健二","中村 みどり"];
+const CATS = ["食料品","日用品","衣類","医薬品","その他"];
+const STORAGE_KEY = "care_ledger_v1";
+
+function fmt(d){ return new Date(d).toLocaleDateString("ja-JP",{year:"numeric",month:"2-digit",day:"2-digit"}); }
+function fmtAmt(n,t){ return (t==="in"?"+":"-")+"¥"+Math.abs(n).toLocaleString(); }
+
+function load(){
+  try{
+    const s = localStorage.getItem(STORAGE_KEY);
+    if(!s) return null;
+    const d = JSON.parse(s);
+    d.records = d.records.map(r=>({...r,date:new Date(r.date)}));
+    return d;
+  }catch(e){ return null; }
+}
+function save(users,records){
+  localStorage.setItem(STORAGE_KEY,JSON.stringify({users,records}));
+}
+
+function App(){
+  const init = load();
+  const [users,setUsers] = React.useState(init?.users||INIT_USERS);
+  const [records,setRecords] = React.useState(init?.records||[]);
+  const [tab,setTab] = React.useState("list");
+  const [form,setForm] = React.useState({user:(init?.users||INIT_USERS)[0],type:"in",amount:"",memo:"",category:"食料品",date:new Date().toISOString().slice(0,10)});
+  const [filterUser,setFilterUser] = React.useState("全員");
+  const [newUserName,setNewUserName] = React.useState("");
+  const [deleteConfirm,setDeleteConfirm] = React.useState(null);
+  const [selectedUser,setSelectedUser] = React.useState(null);
+  const [receiptImg,setReceiptImg] = React.useState(null);
+  const [loading,setLoading] = React.useState(false);
+  const [aiResult,setAiResult] = React.useState(null);
+  const fileRef = React.useRef();
+  const camRef = React.useRef();
+
+  function persist(u,r){ save(u,r); }
+
+  function balance(u){ return records.filter(r=>r.user===u).reduce((s,r)=>r.type==="in"?s+r.amount:s-r.amount,0); }
+
+  function addUser(){
+    const name=newUserName.trim();
+    if(!name||users.includes(name)) return;
+    const nu=[...users,name];
+    setUsers(nu); setNewUserName(""); persist(nu,records);
+  }
+
+  function removeUser(name){
+    if(deleteConfirm!==name){setDeleteConfirm(name);return;}
+    const nu=users.filter(x=>x!==name);
+    const nr=records.filter(x=>x.user!==name);
+    setUsers(nu); setRecords(nr);
+    if(form.user===name) setForm(f=>({...f,user:nu[0]||""}));
+    if(filterUser===name) setFilterUser("全員");
+    if(selectedUser===name) setSelectedUser(null);
+    setDeleteConfirm(null); persist(nu,nr);
+  }
+
+  async function analyzeReceipt(base64,mimeType){
+    setLoading(true); setAiResult(null);
+    try{
+      const res=await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,
+          messages:[{role:"user",content:[
+            {type:"image",source:{type:"base64",media_type:mimeType,data:base64}},
+            {type:"text",text:`このレシートから以下をJSON形式のみで返してください。他テキスト不要。\n{"amount":合計金額(数値のみ),"memo":"店名と主な購入品（30字以内）","category":"食料品 or 日用品 or 衣類 or 医薬品 or その他"}`}
+          ]}]})
+      });
+      const data=await res.json();
+      const text=data.content.map(c=>c.text||"").join("");
+      const parsed=JSON.parse(text.replace(/```json|```/g,"").trim());
+      setAiResult(parsed);
+      setForm(f=>({...f,amount:String(parsed.amount),memo:parsed.memo,category:parsed.category||"その他",type:"out"}));
+    }catch(e){ setAiResult({error:"読み取りに失敗しました。手動で入力してください。"}); }
+    setLoading(false);
+  }
+
+  function handleFile(e){
+    const file=e.target.files[0]; if(!file) return;
+    const reader=new FileReader();
+    reader.onload=ev=>{
+      setReceiptImg(ev.target.result);
+      analyzeReceipt(ev.target.result.split(",")[1],file.type);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function addRecord(){
+    const amt=parseFloat(form.amount);
+    if(!form.user||isNaN(amt)||amt<=0) return;
+    const nr=[...records,{id:Date.now(),date:new Date(form.date),user:form.user,type:form.type,amount:amt,memo:form.memo,category:form.type==="out"?form.category:undefined,receipt:receiptImg}];
+    setRecords(nr); persist(users,nr);
+    setForm(f=>({...f,amount:"",memo:"",category:"食料品"}));
+    setReceiptImg(null); setAiResult(null); setTab("list");
+  }
+
+  function exportCSV(){
+    const tgt=records.filter(r=>filterUser==="全員"||r.user===filterUser).sort((a,b)=>b.date-a.date);
+    const rows=[["日付","利用者","種別","金額","カテゴリ","メモ"]];
+    tgt.forEach(r=>rows.push([fmt(r.date),r.user,r.type==="in"?"入金":"出金",r.amount,r.category||"",r.memo||""]));
+    const bom="\uFEFF";
+    const csv=bom+rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");a.href=url;
+    a.download=`出納帳_${filterUser}_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+  }
+
+  function printTable(){
+    const tgt=records.filter(r=>filterUser==="全員"||r.user===filterUser).sort((a,b)=>b.date-a.date);
+    const rows=tgt.map(r=>`<tr><td>${fmt(r.date)}</td><td>${r.user}</td><td style="color:${r.type==="in"?"#166534":"#991b1b"}">${r.type==="in"?"入金":"出金"}</td><td style="text-align:right">${r.type==="in"?"+":"-"}¥${r.amount.toLocaleString()}</td><td>${r.category||""}</td><td>${r.memo||""}</td></tr>`).join("");
+    const html=`<!DOCTYPE html><html><head><meta charset="utf-8"><title>出納帳</title><style>body{font-family:sans-serif;padding:24px;font-size:13px}h2{font-size:16px;margin-bottom:4px}p{color:#666;margin:0 0 16px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:6px 8px;text-align:left}th{background:#f5f5f5}</style></head><body><h2>利用者出納帳　小規模多機能型居宅介護</h2><p>対象：${filterUser}　印刷日：${new Date().toLocaleDateString("ja-JP")}</p><table><thead><tr><th>日付</th><th>利用者</th><th>種別</th><th>金額</th><th>カテゴリ</th><th>メモ</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+    const w=window.open("","_blank"); w.document.write(html); w.document.close(); w.print();
+  }
+
+  const filtered=records.filter(r=>filterUser==="全員"||r.user===filterUser).sort((a,b)=>b.date-a.date);
+
+  const s={
+    wrap:{maxWidth:500,margin:"0 auto",paddingBottom:80},
+    header:{background:"#fff",padding:"14px 16px",borderBottom:"1px solid #e5e5e5",position:"sticky",top:0,zIndex:10},
+    tabs:{display:"flex",background:"#fff",borderBottom:"1px solid #e5e5e5",overflowX:"auto"},
+    tab:(a)=>({padding:"12px 16px",border:"none",borderBottom:a?"2px solid #3b82f6":"2px solid transparent",background:"transparent",fontWeight:a?500:400,color:a?"#3b82f6":"#888",whiteSpace:"nowrap",fontSize:14}),
+    body:{padding:"12px 16px"},
+    card:{background:"#fff",border:"1px solid #e5e5e5",borderRadius:12,padding:"10px 14px",marginBottom:8},
+    label:{fontSize:12,color:"#888",display:"block",marginBottom:4},
+    section:{marginBottom:12},
+    inBtn:(a)=>({flex:1,padding:"10px 0",border:a?"2px solid #3b82f6":"1px solid #ddd",borderRadius:8,background:a?"#eff6ff":"#fff",color:a?"#1d4ed8":"#1a1a1a",fontWeight:a?500:400,fontSize:14}),
+    recBtn:{background:"#eff6ff",color:"#1d4ed8",border:"1px solid #bfdbfe",borderRadius:8,padding:"8px 0",flex:1,fontSize:13},
+    primary:{width:"100%",padding:"12px 0",background:"#3b82f6",color:"#fff",border:"none",borderRadius:10,fontWeight:500,fontSize:16,marginTop:4},
+    danger:{border:"1px solid #fca5a5",background:"#fef2f2",color:"#b91c1c"},
+    green:{color:"#166534"},red:{color:"#991b1b"},
+    muted:{fontSize:12,color:"#888"},
+  };
+
+  return (
+    <div style={s.wrap}>
+      <div style={s.header}>
+        <div style={{fontSize:17,fontWeight:600}}>利用者出納帳</div>
+        <div style={{fontSize:12,color:"#888",marginTop:2}}>小規模多機能型居宅介護</div>
+      </div>
+
+      <div style={s.tabs}>
+        {[["list","一覧"],["add","入出金記録"],["balance","残高"],["users","利用者管理"]].map(([k,v])=>(
+          <button key={k} style={s.tab(tab===k)} onClick={()=>{setTab(k);setSelectedUser(null);}}>{v}</button>
+        ))}
+      </div>
+
+      <div style={s.body}>
+
+        {/* 一覧 */}
+        {tab==="list" && <div>
+          <div style={{display:"flex",gap:8,marginBottom:12,alignItems:"center",flexWrap:"wrap"}}>
+            <select value={filterUser} onChange={e=>setFilterUser(e.target.value)} style={{flex:1,minWidth:120}}>
+              <option>全員</option>
+              {users.map(u=><option key={u}>{u}</option>)}
+            </select>
+            <button onClick={exportCSV}>CSV</button>
+            <button onClick={printTable}>印刷</button>
+          </div>
+          {filtered.length===0 && <p style={{color:"#888",fontSize:14}}>記録がありません</p>}
+          {filtered.map(r=>(
+            <div key={r.id} style={{...s.card,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{flex:1}}>
+                <div style={s.muted}>{fmt(r.date)} · {r.user}</div>
+                <div style={{fontSize:14,marginTop:2}}>{r.memo||"—"}</div>
+                {r.category && <span style={{fontSize:11,background:"#f3f4f6",padding:"2px 6px",borderRadius:4,color:"#666",display:"inline-block",marginTop:4}}>{r.category}</span>}
+              </div>
+              <div style={{textAlign:"right",marginLeft:12}}>
+                <div style={{fontSize:16,fontWeight:500,...(r.type==="in"?s.green:s.red)}}>{fmtAmt(r.amount,r.type)}</div>
+                {r.receipt && <img src={r.receipt} style={{width:36,height:36,objectFit:"cover",borderRadius:4,marginTop:4,border:"1px solid #e5e5e5"}} />}
+              </div>
+            </div>
+          ))}
+        </div>}
+
+        {/* 入出金記録 */}
+        {tab==="add" && <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            <div style={s.section}>
+              <label style={s.label}>日付</label>
+              <input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} />
+            </div>
+            <div style={s.section}>
+              <label style={s.label}>利用者</label>
+              <select value={form.user} onChange={e=>setForm(f=>({...f,user:e.target.value}))}>
+                {users.map(u=><option key={u}>{u}</option>)}
+              </select>
+            </div>
+          </div>
+          <div>
+            <label style={s.label}>種別</label>
+            <div style={{display:"flex",gap:8}}>
+              <button style={s.inBtn(form.type==="in")} onClick={()=>setForm(f=>({...f,type:"in"}))}>入金（預かり）</button>
+              <button style={s.inBtn(form.type==="out")} onClick={()=>setForm(f=>({...f,type:"out"}))}>出金（お買い物）</button>
+            </div>
+          </div>
+          {form.type==="out" && <div>
+            <label style={s.label}>カテゴリ</label>
+            <select value={form.category} onChange={e=>setForm(f=>({...f,category:e.target.value}))}>
+              {CATS.map(c=><option key={c}>{c}</option>)}
+            </select>
+          </div>}
+          <div>
+            <label style={s.label}>金額（円）</label>
+            <input type="number" value={form.amount} onChange={e=>setForm(f=>({...f,amount:e.target.value}))} placeholder="例: 1280" />
+          </div>
+          <div>
+            <label style={s.label}>メモ</label>
+            <input type="text" value={form.memo} onChange={e=>setForm(f=>({...f,memo:e.target.value}))} placeholder="例: スーパーでの買い物" />
+          </div>
+          <div style={{background:"#f8fafc",borderRadius:10,padding:"12px 14px"}}>
+            <div style={{fontSize:13,fontWeight:500,marginBottom:8}}>レシートを読み取る（任意）</div>
+            <div style={{display:"flex",gap:8}}>
+              <button style={s.recBtn} onClick={()=>fileRef.current.click()}>画像を選択</button>
+              <button style={s.recBtn} onClick={()=>camRef.current.click()}>カメラで撮影</button>
+            </div>
+            <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={handleFile} />
+            <input ref={camRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={handleFile} />
+            {loading && <p style={{fontSize:13,color:"#888",marginTop:8}}>AIが読み取り中...</p>}
+            {receiptImg && <img src={receiptImg} style={{width:"100%",maxHeight:160,objectFit:"contain",marginTop:8,borderRadius:8,border:"1px solid #e5e5e5"}} />}
+            {aiResult&&!aiResult.error && <p style={{fontSize:12,color:"#166534",marginTop:6}}>読み取り完了：¥{Number(aiResult.amount).toLocaleString()} / {aiResult.memo}</p>}
+            {aiResult?.error && <p style={{fontSize:12,color:"#991b1b",marginTop:6}}>{aiResult.error}</p>}
+          </div>
+          <button style={s.primary} onClick={addRecord}>記録する</button>
+        </div>}
+
+        {/* 残高 */}
+        {tab==="balance" && <div>
+          {users.map(u=>{
+            const bal=balance(u);
+            return <div key={u} style={{...s.card,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontSize:15,fontWeight:500}}>{u}</div>
+                <div style={s.muted}>{records.filter(r=>r.user===u).length}件の記録</div>
+              </div>
+              <div style={{fontSize:18,fontWeight:600,...(bal>=0?s.green:s.red)}}>{bal>=0?"+":""}¥{bal.toLocaleString()}</div>
+            </div>;
+          })}
+        </div>}
+
+        {/* 利用者管理 — 一覧 */}
+        {tab==="users" && !selectedUser && <div>
+          <div style={{background:"#f8fafc",borderRadius:10,padding:"12px 14px",marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:500,marginBottom:8}}>利用者を追加</div>
+            <div style={{display:"flex",gap:8}}>
+              <input type="text" value={newUserName} onChange={e=>setNewUserName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addUser()} placeholder="氏名を入力（例：高橋 太郎）" />
+              <button style={{background:"#eff6ff",color:"#1d4ed8",border:"1px solid #bfdbfe",whiteSpace:"nowrap"}} onClick={addUser}>追加</button>
+            </div>
+          </div>
+          <div style={{...s.muted,marginBottom:8}}>登録中 {users.length}名 ※名前をタップで明細確認</div>
+          {users.map(u=>(
+            <div key={u} style={{...s.card,display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}} onClick={()=>{setSelectedUser(u);setDeleteConfirm(null);}}>
+              <div>
+                <div style={{fontSize:14,fontWeight:500,color:"#1d4ed8"}}>{u}</div>
+                <div style={s.muted}>残高 ¥{balance(u).toLocaleString()} · {records.filter(r=>r.user===u).length}件</div>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={s.muted}>明細 →</span>
+                <button style={deleteConfirm===u?s.danger:{}} onClick={e=>{e.stopPropagation();removeUser(u);}}>
+                  {deleteConfirm===u?"本当に削除？":"削除"}
+                </button>
+              </div>
+            </div>
+          ))}
+          {deleteConfirm && <p style={{fontSize:12,color:"#991b1b",marginTop:4}}>※削除すると記録もすべて消去されます。</p>}
+        </div>}
+
+        {/* 利用者管理 — 明細 */}
+        {tab==="users" && selectedUser && (()=>{
+          const ur=records.filter(r=>r.user===selectedUser).sort((a,b)=>a.date-b.date);
+          let run=0;
+          const rows=ur.map(r=>{run+=r.type==="in"?r.amount:-r.amount;return{...r,running:run};}).reverse();
+          return <div>
+            <button style={{marginBottom:12}} onClick={()=>setSelectedUser(null)}>← 一覧に戻る</button>
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:16,fontWeight:600}}>{selectedUser}</div>
+              <div style={{fontSize:13,color:"#888",marginTop:2}}>
+                現在残高：<span style={{fontWeight:600,...(balance(selectedUser)>=0?s.green:s.red)}}>¥{balance(selectedUser).toLocaleString()}</span>　全{ur.length}件
+              </div>
+            </div>
+            {rows.length===0 && <p style={{fontSize:14,color:"#888"}}>記録がありません</p>}
+            {rows.map(r=>(
+              <div key={r.id} style={{...s.card,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div style={{flex:1}}>
+                  <div style={s.muted}>{fmt(r.date)}</div>
+                  <div style={{fontSize:14,marginTop:2}}>{r.memo||"—"}</div>
+                  {r.category && <span style={{fontSize:11,background:"#f3f4f6",padding:"2px 6px",borderRadius:4,color:"#666",display:"inline-block",marginTop:4}}>{r.category}</span>}
+                </div>
+                <div style={{textAlign:"right",marginLeft:12}}>
+                  <div style={{fontSize:15,fontWeight:500,...(r.type==="in"?s.green:s.red)}}>{fmtAmt(r.amount,r.type)}</div>
+                  <div style={{fontSize:11,color:"#888",marginTop:2}}>残高 ¥{r.running.toLocaleString()}</div>
+                </div>
+              </div>
+            ))}
+          </div>;
+        })()}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
